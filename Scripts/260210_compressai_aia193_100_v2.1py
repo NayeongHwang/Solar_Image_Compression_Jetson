@@ -1,0 +1,251 @@
+import os
+import glob
+import torch
+import numpy as np
+import math
+import time
+from pathlib import Path
+from astropy.io import fits
+from PIL import Image
+from compressai.zoo import cheng2020_attn
+from pytorch_msssim import ms_ssim
+from skimage.metrics import structural_similarity as ssim_func
+from jtop import jtop
+import pandas as pd
+import warnings
+warnings.filterwarnings("ignore")
+
+class SolarCompressorExperiment:
+    def __init__(self, quality=6):
+        # 젯슨 GPU(CUDA) 활용 설정
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # 사전 학습된 Cheng2020 모델 로드
+        self.model = cheng2020_attn(quality=quality, pretrained=True).eval().to(self.device)
+        print(f"✓ 모델 로드 완료 (Quality: {quality}, Device: {self.device})")
+
+    def get_power_avg(self, sec=0.2):
+        """jtop 기반 전력 측정 (solarzip과 동일)"""
+        samples = []
+        try:
+            with jtop() as jetson:
+                t0 = time.time()
+                while time.time() - t0 < sec:
+                    if jetson.ok():
+                        p = jetson.stats["Power TOT"]
+                        samples.append(p / 1000.0)
+                    time.sleep(0.01)
+        except Exception as e:
+            print(f"⚠️ 전력 측정 실패: {e}")
+            return 0.0
+        return float(np.mean(samples)) if samples else 0.0
+
+    def senior_preprocessing(self, raw_data):
+        """solarzip의 전처리 방식 적용"""
+        data = np.clip(raw_data, 0, None)
+        data_16bit = data.astype(np.uint16)
+        
+        # Log 변환 (태양 데이터의 넓은 범위를 압축)
+        log_dn = np.log1p(data_16bit.astype(np.float32))
+        log_max = np.log1p(data_16bit.max())
+        
+        # 8-bit 스케일링 (AI 모델 입력 규격: 0~255)
+        data_8bit = (255.0 * (log_dn / (log_max + 1e-12))).astype(np.uint8)
+        
+        return data_8bit, data_16bit, log_max
+
+    def load_fits_data(self, file_path):
+        """FITS 파일에서 데이터 추출 (구조 자동 감지)"""
+        with fits.open(file_path) as hdul:
+            # FITS 구조 확인
+            if len(hdul) == 0:
+                raise ValueError("FITS 파일이 비어있습니다")
+            
+            # Primary HDU에 데이터가 있는지 확인
+            if hdul[0].data is not None:
+                raw_data = hdul[0].data.astype(np.float32)
+            # Extension이 있으면 첫 번째 extension 사용
+            elif len(hdul) > 1 and hdul[1].data is not None:
+                raw_data = hdul[1].data.astype(np.float32)
+            else:
+                raise ValueError("FITS 파일에서 데이터를 찾을 수 없습니다")
+            
+        return raw_data
+
+    def process_fits(self, file_path):
+        """FITS 로드 -> 512x512 리사이징 -> 전처리 -> 텐서 변환"""
+        # 1. FITS 데이터 로드 (구조 자동 감지)
+        raw_data = self.load_fits_data(file_path)
+        
+        # 2. 512x512 리사이징
+        img = Image.fromarray(raw_data)
+        img_res = img.resize((512, 512), resample=Image.BILINEAR)
+        raw_512 = np.array(img_res)
+        
+        # 3. Senior Preprocessing 적용
+        data_8bit, data_16bit, log_max = self.senior_preprocessing(raw_512)
+        
+        # 4. 텐서 변환 (N, C, H, W) 및 0~1 정규화
+        input_tensor = torch.from_numpy(data_8bit).float().div(255.0)
+        input_tensor = input_tensor.unsqueeze(0).unsqueeze(0).repeat(1, 3, 1, 1)
+        
+        return input_tensor.to(self.device), data_16bit, log_max
+
+    def calculate_ssim(self, original, reconstructed):
+        """SSIM 계산 (solarzip과 동일)"""
+        d_range = original.max() - original.min()
+        if d_range == 0: 
+            d_range = 1.0
+        return ssim_func(original, reconstructed, data_range=d_range)
+
+    def evaluate(self, input_tensor, original_16bit, log_max):
+        """압축 추론 및 메트릭 산출 (전력 측정 포함)"""
+        # 전력 측정 시작
+        p_before = self.get_power_avg(0.2)
+        
+        with torch.no_grad():
+            start_time = time.time()
+            output = self.model(input_tensor)
+            elapsed = time.time() - start_time
+        
+        # 전력 측정 종료
+        p_after = self.get_power_avg(0.2)
+        avg_power = (p_before + p_after) / 2.0
+        
+        # BPP 계산 (Entropy 기반)
+        num_pixels = input_tensor.size(0) * input_tensor.size(2) * input_tensor.size(3)
+        bpp = sum(torch.log(l).sum() for l in output['likelihoods'].values()) / (-math.log(2) * num_pixels)
+        
+        # 역변환: 8-bit 복원 -> 원본 16-bit 스케일 복구
+        recon_8bit = output['x_hat'].clamp(0, 1).squeeze().cpu().numpy()[0] * 255.0
+        recon_16bit = np.expm1((recon_8bit / 255.0) * log_max).astype(np.uint16)
+        
+        # PSNR 계산 (원본 16-bit vs 복원 16-bit)
+        mse = np.mean((original_16bit.astype(np.float32) - recon_16bit.astype(np.float32))**2)
+        psnr = 20 * math.log10(original_16bit.max() / math.sqrt(mse)) if mse > 0 else 100
+        
+        # SSIM 계산
+        ssim_val = self.calculate_ssim(original_16bit, recon_16bit)
+        
+        # 에너지 효율 계산 (solarzip과 동일 방식)
+        energy = (elapsed * avg_power / original_16bit.size) * 1e6
+        
+        # GPU 메모리 정리
+        if self.device == 'cuda':
+            torch.cuda.empty_cache()
+        
+        return {
+            'bpp': bpp.item(),
+            'psnr': psnr,
+            'ssim': ssim_val,
+            'time': elapsed,
+            'avg_power': avg_power,
+            'energy': energy
+        }
+
+def main():
+    # --- 1단계: 경로 입력 받기 ---
+    data_dir = input("FITS 파일들이 있는 폴더 경로를 입력하세요: ").strip()
+    
+    if not os.path.exists(data_dir):
+        print(f"❌ 경로를 찾을 수 없습니다: {data_dir}")
+        return
+    
+    files = sorted(glob.glob(os.path.join(data_dir, "*.fits")))
+    
+    if not files:
+        print("❌ FITS 파일을 찾을 수 없습니다. 경로를 확인하세요.")
+        return
+
+    print(f"✓ {len(files)}개의 FITS 파일 발견")
+    
+    # Quality 선택
+    quality_input = input("모델 Quality를 입력하세요 (1~8, 기본값 6): ").strip()
+    quality = int(quality_input) if quality_input.isdigit() else 6
+    
+    experiment = SolarCompressorExperiment(quality=quality)
+    results = []
+    failed_files = []
+
+    print(f"\n🚀 총 {len(files)}개 파일 처리 시작...\n")
+
+    # --- 2단계: 루프 실행 ---
+    for i, f in enumerate(files):
+        try:
+            input_ts, original_16bit, log_max = experiment.process_fits(f)
+            metrics = experiment.evaluate(input_ts, original_16bit, log_max)
+            
+            results.append({
+                'filename': os.path.basename(f),
+                'bpp': round(metrics['bpp'], 4),
+                'psnr': round(metrics['psnr'], 2),
+                'ssim': round(metrics['ssim'], 4),
+                'time': round(metrics['time'], 3),
+                'avg_power': round(metrics['avg_power'], 2),
+                'energy': round(metrics['energy'], 2)
+            })
+            
+            if (i + 1) % 10 == 0:
+                print(f"[{i + 1}/{len(files)}] 처리 중... "
+                      f"(최근: PSNR={metrics['psnr']:.2f}dB, SSIM={metrics['ssim']:.4f})")
+        
+        except Exception as e:
+            failed_files.append(os.path.basename(f))
+            print(f"⚠️ 오류 발생 ({os.path.basename(f)}): {e}")
+
+    # --- 3단계: 평균 결과 출력 및 저장 ---
+    if not results:
+        print("\n❌ 처리된 파일이 없습니다.")
+        if failed_files:
+            print(f"\n실패한 파일 목록 ({len(failed_files)}개):")
+            for fname in failed_files[:10]:  # 최대 10개만 표시
+                print(f"  - {fname}")
+            if len(failed_files) > 10:
+                print(f"  ... 외 {len(failed_files)-10}개")
+        return
+    
+    df = pd.DataFrame(results)
+    
+    print("\n" + "="*60)
+    print(f"📊 최종 실험 결과 (CompressAI - Quality {quality})")
+    print("="*60)
+    print(f"  처리 파일 수    : {len(results)} 장")
+    print(f"  실패 파일 수    : {len(failed_files)} 장")
+    print(f"  Average BPP     : {df['bpp'].mean():.4f}")
+    print(f"  Average PSNR    : {df['psnr'].mean():.2f} dB")
+    print(f"  Average SSIM    : {df['ssim'].mean():.4f}")
+    print(f"  Avg Time        : {df['time'].mean():.3f} sec/frame")
+    print(f"  Avg Power       : {df['avg_power'].mean():.2f} W")
+    print(f"  Avg Energy      : {df['energy'].mean():.2f} μJ/pixel")
+    print("="*60)
+
+    # 결과를 CSV로 저장
+    output_filename = f"compressai_q{quality}_results.csv"
+    df.to_csv(output_filename, index=False)
+    print(f"✓ 세부 결과가 '{output_filename}'로 저장되었습니다.\n")
+    
+    # 요약 통계 저장
+    summary = pd.DataFrame([{
+        'Quality': quality,
+        'Files_Success': len(results),
+        'Files_Failed': len(failed_files),
+        'Avg_BPP': round(df['bpp'].mean(), 4),
+        'Avg_PSNR': round(df['psnr'].mean(), 2),
+        'Avg_SSIM': round(df['ssim'].mean(), 4),
+        'Avg_Time': round(df['time'].mean(), 3),
+        'Avg_Power': round(df['avg_power'].mean(), 2),
+        'Avg_Energy': round(df['energy'].mean(), 2)
+    }])
+    
+    summary_filename = f"compressai_q{quality}_summary.csv"
+    summary.to_csv(summary_filename, index=False)
+    print(f"✓ 요약 결과가 '{summary_filename}'로 저장되었습니다.")
+    
+    # 실패한 파일 목록 저장
+    if failed_files:
+        failed_df = pd.DataFrame({'failed_files': failed_files})
+        failed_filename = f"compressai_q{quality}_failed.csv"
+        failed_df.to_csv(failed_filename, index=False)
+        print(f"⚠️ 실패한 파일 목록이 '{failed_filename}'로 저장되었습니다.")
+
+if __name__ == "__main__":
+    main()
